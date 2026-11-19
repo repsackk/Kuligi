@@ -30,8 +30,14 @@ const packages = {
   romantic: { name: 'Kulig romantyczny 23:00', price: 3000 }
 };
 
-const slots = ['10:00', '12:30', '15:00', '17:30', '20:00', '23:00'];
+const slots = [
+  '10:00', '12:30', '15:00',
+  '17:30', '20:00', '23:00'
+];
+
 const MAX_GROUP = 20;
+const SESSION_MS = 60 * 60 * 1000;
+const COOKIE_NAME = 'kuligi_session';
 
 const testMode =
   process.env.TEST_PAYMENTS === 'true' &&
@@ -41,7 +47,6 @@ const adminPath = '/' + (
   process.env.ADMIN_PATH || 'organizator-7f9a2'
 ).replace(/^\/+|\/+$/g, '');
 
-const sessions = new Map();
 const loginAttempts = new Map();
 const testAttempts = new Map();
 
@@ -84,6 +89,30 @@ function needDb(req, res, next) {
   next();
 }
 
+// SESJE ADMINISTRATORA W POSTGRESQL
+
+let sessionTableReady = null;
+
+async function ensureSessionTable() {
+  if (!pool) throw Error('Brak połączenia z bazą.');
+
+  if (!sessionTableReady) {
+    sessionTableReady = pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_sessions (
+        token_hash TEXT PRIMARY KEY,
+        csrf_token TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `).catch(err => {
+      sessionTableReady = null;
+      throw err;
+    });
+  }
+
+  await sessionTableReady;
+}
+
 function parseCookies(req) {
   const result = {};
 
@@ -98,52 +127,106 @@ function parseCookies(req) {
   return result;
 }
 
-function getSession(req) {
-  const token = parseCookies(req).kuligi_session;
-  if (!token) return null;
-
-  const hash = crypto
+function hashToken(token) {
+  return crypto
     .createHash('sha256')
     .update(token)
     .digest('hex');
+}
 
-  const session = sessions.get(hash);
+const cookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  path: '/'
+};
 
-  if (!session || session.expires < Date.now()) {
+async function getSession(req) {
+  if (req.adminSession) return req.adminSession;
+
+  const token = parseCookies(req)[COOKIE_NAME];
+
+  if (!token || !/^[a-f0-9]{64}$/.test(token)) {
     return null;
   }
 
-  session.expires = Date.now() + 8 * 3600000;
-  return { session, hash };
+  await ensureSessionTable();
+
+  const tokenHash = hashToken(token);
+
+  const { rows } = await pool.query(`
+    SELECT token_hash, csrf_token, expires_at
+    FROM admin_sessions
+    WHERE token_hash = $1
+      AND expires_at > NOW()
+    LIMIT 1
+  `, [tokenHash]);
+
+  if (!rows.length) return null;
+
+  req.adminSession = {
+    hash: tokenHash,
+    csrf: rows[0].csrf_token,
+    expires: rows[0].expires_at
+  };
+
+  return req.adminSession;
 }
 
-function auth(req, res, next) {
-  if (!getSession(req)) {
-    return res.status(401).json({
-      error: 'Zaloguj się do panelu.'
-    });
+async function auth(req, res, next) {
+  try {
+    const session = await getSession(req);
+
+    if (!session) {
+      return res.status(401).json({
+        error: 'Sesja wygasła. Zaloguj się ponownie.'
+      });
+    }
+
+    next();
+  } catch (err) {
+    next(err);
   }
-  next();
 }
 
-function csrf(req, res, next) {
+async function csrf(req, res, next) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     return next();
   }
 
-  const active = getSession(req);
+  try {
+    const session = await getSession(req);
 
-  if (
-    !active ||
-    req.headers['x-csrf-token'] !== active.session.csrf
-  ) {
-    return res.status(403).json({
-      error: 'Brak tokenu zabezpieczającego.'
-    });
+    if (!session) {
+      return res.status(401).json({
+        error: 'Sesja wygasła.'
+      });
+    }
+
+    const supplied = req.headers['x-csrf-token'] || '';
+    const expected = session.csrf;
+
+    const valid =
+      typeof supplied === 'string' &&
+      Buffer.byteLength(supplied) === Buffer.byteLength(expected) &&
+      crypto.timingSafeEqual(
+        Buffer.from(supplied),
+        Buffer.from(expected)
+      );
+
+    if (!valid) {
+      return res.status(403).json({
+        error: 'Nieprawidłowy token CSRF.'
+      });
+    }
+
+    next();
+  } catch (err) {
+    next(err);
   }
-
-  next();
 }
+
+// AUTOMATYCZNE TERMINY
 
 async function ensureSchedule() {
   await pool.query(`
@@ -235,98 +318,129 @@ app.get(adminPath, (req, res) => {
   res.sendFile(path.join(ROOT, 'private', 'panel.html'));
 });
 
-app.post('/api/admin/login', (req, res) => {
-  const key = req.ip || 'unknown';
-  const now = Date.now();
+// LOGOWANIE — COOKIE NA 1 GODZINĘ
 
-  const attempt = loginAttempts.get(key) || {
-    count: 0,
-    until: 0
-  };
+app.post('/api/admin/login', needDb, async (req, res, next) => {
+  try {
+    const key = req.ip || 'unknown';
+    const now = Date.now();
 
-  if (attempt.until > now) {
-    return res.status(429).json({
-      error: 'Za dużo prób. Spróbuj za 15 minut.'
-    });
-  }
+    const attempt = loginAttempts.get(key) || {
+      count: 0,
+      until: 0
+    };
 
-  const expected = process.env.ADMIN_PASSWORD || '';
-  const supplied = String(req.body?.password || '');
-
-  const valid =
-    expected.length >= 16 &&
-    Buffer.byteLength(expected) === Buffer.byteLength(supplied) &&
-    crypto.timingSafeEqual(
-      Buffer.from(expected),
-      Buffer.from(supplied)
-    );
-
-  if (!valid) {
-    attempt.count++;
-
-    if (attempt.count >= 5) {
-      attempt.count = 0;
-      attempt.until = now + 900000;
+    if (attempt.until > now) {
+      return res.status(429).json({
+        error: 'Za dużo prób. Spróbuj za 15 minut.'
+      });
     }
 
-    loginAttempts.set(key, attempt);
+    const expected = process.env.ADMIN_PASSWORD || '';
+    const supplied = String(req.body?.password || '');
 
-    return res.status(401).json({
-      error: 'Nieprawidłowe hasło.'
+    const valid =
+      expected.length >= 16 &&
+      Buffer.byteLength(expected) === Buffer.byteLength(supplied) &&
+      crypto.timingSafeEqual(
+        Buffer.from(expected),
+        Buffer.from(supplied)
+      );
+
+    if (!valid) {
+      attempt.count++;
+
+      if (attempt.count >= 5) {
+        attempt.count = 0;
+        attempt.until = now + 900000;
+      }
+
+      loginAttempts.set(key, attempt);
+
+      return res.status(401).json({
+        error: 'Nieprawidłowe hasło.'
+      });
+    }
+
+    loginAttempts.delete(key);
+
+    await ensureSessionTable();
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const csrfToken = crypto.randomBytes(24).toString('hex');
+    const tokenHash = hashToken(token);
+
+    await pool.query(`
+      INSERT INTO admin_sessions (
+        token_hash,
+        csrf_token,
+        expires_at
+      )
+      VALUES (
+        $1,
+        $2,
+        NOW() + INTERVAL '1 hour'
+      )
+    `, [tokenHash, csrfToken]);
+
+    res.cookie(COOKIE_NAME, token, {
+      ...cookieOptions,
+      maxAge: SESSION_MS
     });
+
+    res.json({
+      ok: true,
+      csrf: csrfToken,
+      expiresIn: 3600
+    });
+
+  } catch (err) {
+    next(err);
   }
-
-  loginAttempts.delete(key);
-
-  const token = crypto.randomBytes(32).toString('hex');
-  const csrfToken = crypto.randomBytes(24).toString('hex');
-
-  const hash = crypto
-    .createHash('sha256')
-    .update(token)
-    .digest('hex');
-
-  sessions.set(hash, {
-    csrf: csrfToken,
-    expires: now + 8 * 3600000
-  });
-
-  const secure = process.env.NODE_ENV === 'production'
-    ? '; Secure'
-    : '';
-
-  res.setHeader(
-    'Set-Cookie',
-    `kuligi_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure}`
-  );
-
-  res.json({ ok: true, csrf: csrfToken });
 });
 
-app.get('/api/admin/session', auth, (req, res) => {
-  const active = getSession(req);
+// SPRAWDZENIE SESJI PO F5
 
+app.get('/api/admin/session', needDb, auth, async (req, res) => {
   res.json({
     ok: true,
-    csrf: active.session.csrf
+    csrf: req.adminSession.csrf,
+    expiresAt: req.adminSession.expires
   });
 });
 
-app.post('/api/admin/logout', auth, csrf, (req, res) => {
-  const active = getSession(req);
-  sessions.delete(active.hash);
+// WYLOGOWANIE — USUWA COOKIE I SESJĘ Z BAZY
 
-  res.setHeader(
-    'Set-Cookie',
-    'kuligi_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'
-  );
+app.post(
+  '/api/admin/logout',
+  needDb,
+  auth,
+  csrf,
+  async (req, res, next) => {
+    try {
+      await pool.query(`
+        DELETE FROM admin_sessions
+        WHERE token_hash = $1
+      `, [req.adminSession.hash]);
 
-  res.json({ ok: true });
-});
+      res.clearCookie(COOKIE_NAME, cookieOptions);
 
-app.use('/api/admin', auth, csrf);
+      res.json({
+        ok: true,
+        message: 'Wylogowano.'
+      });
 
-// STRONA
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ZABEZPIECZENIE WSZYSTKICH DALSZYCH API ADMINA
+
+app.use('/api/admin', needDb, auth, csrf);
+
+// STRONA PUBLICZNA
 
 app.use(express.static(path.join(ROOT, 'public'), {
   index: 'index.html',
@@ -345,7 +459,7 @@ app.get('/api/config', (req, res) => {
   });
 });
 
-// KALENDARZ
+// KALENDARZ — DOSTĘPNE DNI
 
 app.get('/api/available-days', needDb, async (req, res, next) => {
   try {
@@ -387,6 +501,8 @@ app.get('/api/available-days', needDb, async (req, res, next) => {
     next(err);
   }
 });
+
+// KALENDARZ — DOSTĘPNE GODZINY
 
 app.get('/api/availability', needDb, async (req, res, next) => {
   try {
@@ -448,7 +564,7 @@ app.get('/api/availability', needDb, async (req, res, next) => {
   }
 });
 
-// REZERWACJE TESTOWE BEZ HASŁA I PŁATNOŚCI
+// REZERWACJE TESTOWE — BEZ HASŁA I PŁATNOŚCI
 
 app.post(
   '/api/bookings',
@@ -473,7 +589,6 @@ app.post(
     } = req.body;
 
     const people = Number(req.body.people);
-
     let client;
 
     try {
@@ -594,7 +709,7 @@ app.post(
   }
 );
 
-// REZERWACJE W PANELU
+// PANEL — REZERWACJE
 
 app.get('/api/admin/bookings', needDb, async (req, res, next) => {
   try {
@@ -623,6 +738,8 @@ app.get('/api/admin/bookings', needDb, async (req, res, next) => {
     next(err);
   }
 });
+
+// PANEL — TERMINY
 
 app.get('/api/admin/departures', needDb, async (req, res, next) => {
   try {
@@ -693,70 +810,88 @@ app.post('/api/admin/departures', needDb, async (req, res, next) => {
   }
 });
 
-app.patch('/api/admin/departures/:id', needDb, async (req, res, next) => {
-  try {
-    if (typeof req.body?.enabled !== 'boolean') {
-      return res.sendStatus(400);
+app.patch(
+  '/api/admin/departures/:id',
+  needDb,
+  async (req, res, next) => {
+    try {
+      if (typeof req.body?.enabled !== 'boolean') {
+        return res.sendStatus(400);
+      }
+
+      const result = await pool.query(
+        'UPDATE departures SET enabled=$1 WHERE id=$2',
+        [req.body.enabled, req.params.id]
+      );
+
+      res.sendStatus(result.rowCount ? 204 : 404);
+
+    } catch (err) {
+      next(err);
     }
-
-    const result = await pool.query(
-      'UPDATE departures SET enabled=$1 WHERE id=$2',
-      [req.body.enabled, req.params.id]
-    );
-
-    res.sendStatus(result.rowCount ? 204 : 404);
-
-  } catch (err) {
-    next(err);
   }
-});
+);
 
-app.patch('/api/admin/bookings/:id', needDb, async (req, res, next) => {
-  try {
-    if (req.body?.status !== 'cancelled') {
-      return res.status(400).json({
-        error: 'Można tylko anulować rezerwację.'
-      });
+// PANEL — ANULOWANIE REZERWACJI
+
+app.patch(
+  '/api/admin/bookings/:id',
+  needDb,
+  async (req, res, next) => {
+    try {
+      if (req.body?.status !== 'cancelled') {
+        return res.status(400).json({
+          error: 'Można tylko anulować rezerwację.'
+        });
+      }
+
+      const result = await pool.query(`
+        UPDATE reservations
+        SET status = 'cancelled'
+        WHERE id = $1
+          AND status IN ('inquiry', 'confirmed')
+        RETURNING id
+      `, [req.params.id]);
+
+      res.sendStatus(result.rowCount ? 204 : 409);
+
+    } catch (err) {
+      next(err);
     }
-
-    const result = await pool.query(`
-      UPDATE reservations
-      SET status = 'cancelled'
-      WHERE id = $1
-        AND status IN ('inquiry', 'confirmed')
-      RETURNING id
-    `, [req.params.id]);
-
-    res.sendStatus(result.rowCount ? 204 : 409);
-
-  } catch (err) {
-    next(err);
   }
-});
+);
 
-app.patch('/api/admin/bookings/:id/notes', needDb, async (req, res, next) => {
-  try {
-    const notes = req.body?.internalNotes;
+// PANEL — NOTATKI
 
-    if (typeof notes !== 'string' || notes.length > 2000) {
-      return res.status(400).json({
-        error: 'Notatka jest za długa.'
-      });
+app.patch(
+  '/api/admin/bookings/:id/notes',
+  needDb,
+  async (req, res, next) => {
+    try {
+      const notes = req.body?.internalNotes;
+
+      if (typeof notes !== 'string' || notes.length > 2000) {
+        return res.status(400).json({
+          error: 'Notatka jest za długa.'
+        });
+      }
+
+      const result = await pool.query(`
+        UPDATE reservations
+        SET internal_notes = $1
+        WHERE id = $2
+        RETURNING id
+      `, [notes, req.params.id]);
+
+      res.sendStatus(result.rowCount ? 204 : 404);
+
+    } catch (err) {
+      next(err);
     }
-
-    const result = await pool.query(`
-      UPDATE reservations
-      SET internal_notes = $1
-      WHERE id = $2
-      RETURNING id
-    `, [notes, req.params.id]);
-
-    res.sendStatus(result.rowCount ? 204 : 404);
-
-  } catch (err) {
-    next(err);
   }
-});
+);
+
+// PANEL — WIADOMOŚCI EMAIL
 
 app.get('/api/admin/emails', needDb, async (req, res, next) => {
   try {
@@ -776,12 +911,10 @@ app.get('/api/admin/emails', needDb, async (req, res, next) => {
   }
 });
 
-setInterval(() => {
-  const now = Date.now();
+// CZYSZCZENIE WYGASŁYCH SESJI
 
-  for (const [key, value] of sessions) {
-    if (value.expires < now) sessions.delete(key);
-  }
+setInterval(async () => {
+  const now = Date.now();
 
   for (const [key, value] of loginAttempts) {
     if (value.until && value.until < now) {
@@ -790,9 +923,26 @@ setInterval(() => {
   }
 
   for (const [key, value] of testAttempts) {
-    if (value.until < now) testAttempts.delete(key);
+    if (value.until < now) {
+      testAttempts.delete(key);
+    }
+  }
+
+  if (pool) {
+    try {
+      await ensureSessionTable();
+
+      await pool.query(`
+        DELETE FROM admin_sessions
+        WHERE expires_at <= NOW()
+      `);
+    } catch (err) {
+      console.error('Czyszczenie sesji:', err.message);
+    }
   }
 }, 600000).unref();
+
+// BŁĘDY
 
 app.use((err, req, res, next) => {
   console.error(err);
@@ -804,6 +954,6 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(
-    `Kuligi uruchomione na porcie ${PORT} | DB: ${pool ? 'OK' : 'BRAK'} | TEST: ${testMode}`
+    `Kuligi na porcie ${PORT} | DB: ${pool ? 'OK' : 'BRAK'} | TEST: ${testMode}`
   );
 });
