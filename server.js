@@ -63,6 +63,78 @@ try{const payload={merchantId:Number(process.env.P24_MERCHANT_ID),posId:Number(p
 // Przelewy24 notifies the server independently of the customer's browser redirect.
 app.post('/api/payments/p24/notification',needDb,async(req,res)=>{if(!p24Ready)return res.sendStatus(503);const body=req.body||{};const id=body.sessionId;const orderId=Number(body.orderId);if(typeof id!=='string'||!Number.isSafeInteger(orderId)||!Number.isSafeInteger(body.amount)||body.currency!=='PLN')return res.sendStatus(400);const client=await pool.connect();try{await client.query('BEGIN');const found=await client.query("SELECT r.*,to_char(d.date,'YYYY-MM-DD') AS date,d.time FROM reservations r JOIN departures d ON d.id=r.departure_id WHERE r.id=$1 FOR UPDATE",[id]);if(!found.rowCount){await client.query('ROLLBACK');return res.sendStatus(404)}const b=found.rows[0];if(b.status==='confirmed'){await client.query('COMMIT');return res.sendStatus(200)}if(b.status!=='pending'||new Date(b.expires_at).getTime()<Date.now()||body.amount!==b.deposit_grosz||Number(body.merchantId)!==Number(process.env.P24_MERCHANT_ID)||Number(body.posId)!==Number(process.env.P24_POS_ID)){await client.query('ROLLBACK');return res.sendStatus(409)}const expected=p24Sign({merchantId:Number(body.merchantId),posId:Number(body.posId),sessionId:id,amount:body.amount,originAmount:Number(body.originAmount),currency:'PLN',orderId,methodId:Number(body.methodId),statement:body.statement,crc:process.env.P24_CRC});if(typeof body.sign!=='string'||!crypto.timingSafeEqual(Buffer.from(expected),Buffer.from(String(body.sign).padEnd(expected.length,' ').slice(0,expected.length)))||body.sign.length!==expected.length){await client.query('ROLLBACK');return res.sendStatus(400)}
 const verify={merchantId:Number(process.env.P24_MERCHANT_ID),posId:Number(process.env.P24_POS_ID),sessionId:id,amount:b.deposit_grosz,currency:'PLN',orderId,sign:p24Sign({sessionId:id,orderId,amount:b.deposit_grosz,currency:'PLN',crc:process.env.P24_CRC})};await p24Call('transaction/verify',verify);await client.query("UPDATE reservations SET status='confirmed',paid_at=NOW(),payment_order_id=$2 WHERE id=$1",[id,orderId]);await enqueueEmails(client,b);await client.query('COMMIT');res.sendStatus(200);drainEmails()}catch(error){await client.query('ROLLBACK').catch(()=>{});console.error('P24 verification:',error.message);res.sendStatus(500)}finally{client.release()}});
+
+app.post('/api/admin/test-booking', needDb, async (req, res, next) => {
+  const { date, time, packageId, name, email, phone, notes } = req.body || {};
+  const people = Number(req.body?.people);
+
+  if (
+    !validDate(date) ||
+    !slots.includes(time) ||
+    !packages[packageId] ||
+    (time === '23:00') !== (packageId === 'romantic') ||
+    !Number.isInteger(people) || people < 1 || people > MAX_GROUP ||
+    typeof name !== 'string' || name.trim().length < 3 ||
+    typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+    typeof phone !== 'string' || phone.length < 7
+  ) {
+    return res.status(400).json({ error: 'Nieprawidłowe dane testowe.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await ensureSchedule();
+    await client.query('BEGIN');
+
+    const departure = await client.query(
+      'SELECT * FROM departures WHERE date=$1 AND time=$2 AND enabled=true FOR UPDATE',
+      [date, time]
+    );
+
+    if (!departure.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Termin niedostępny.' });
+    }
+
+    const d = departure.rows[0];
+
+    const existing = await client.query(
+      `SELECT 1 FROM reservations
+       WHERE departure_id=$1
+       AND (status='confirmed' OR (status='pending' AND expires_at>NOW()))
+       LIMIT 1`,
+      [d.id]
+    );
+
+    if (existing.rowCount || people > d.capacity) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Termin jest już zajęty lub grupa jest za duża.' });
+    }
+
+    const id = crypto.randomUUID();
+    const amount = packages[packageId].price * 100;
+
+    await client.query(
+      `INSERT INTO reservations
+       (id, departure_id, package_id, people, name, email, phone, notes,
+        amount_grosz, deposit_grosz, status, expires_at, payment_reference)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'confirmed',NULL,$11)`,
+      [
+        id, d.id, packageId, people, name.trim(), email.trim(),
+        phone.trim(), String(notes || '').slice(0, 500),
+        amount, amount / 2, 'TEST-' + id
+      ]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json({ ok: true, id, test: true });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
 app.get('/api/admin/bookings',needDb,async(req,res,next)=>{try{const {rows}=await pool.query(`SELECT r.*,to_char(d.date,'YYYY-MM-DD') AS date,d.time FROM reservations r JOIN departures d ON d.id=r.departure_id WHERE r.status='confirmed' AND d.date>=CURRENT_DATE ORDER BY d.date,d.time LIMIT 500`);res.json(rows.map(r=>({...r,packageId:r.package_id,amount:r.amount_grosz/100,depositAmount:r.deposit_grosz/100})));}catch(e){next(e)}});
 app.get('/api/admin/departures',needDb,async(req,res,next)=>{try{await ensureSchedule();const {rows}=await pool.query(`SELECT d.id,to_char(d.date,'YYYY-MM-DD') AS date,d.time,d.capacity,d.enabled,COALESCE(SUM(r.people) FILTER (WHERE r.status='confirmed' OR (r.status='pending' AND r.expires_at>NOW())),0)::int AS taken FROM departures d LEFT JOIN reservations r ON r.departure_id=d.id WHERE d.date>=CURRENT_DATE GROUP BY d.id ORDER BY d.date,d.time LIMIT 500`);res.json(rows)}catch(e){next(e)}});
 app.post('/api/admin/departures',needDb,async(req,res,next)=>{try{const {date,time,capacity}=req.body||{};const cap=Number(capacity);if(!validDate(date)||!slots.includes(time)||!Number.isInteger(cap)||cap<1||cap>500)return res.status(400).json({error:'Nieprawidłowe dane terminu'});const {rows}=await pool.query(`INSERT INTO departures(date,time,capacity) VALUES($1,$2,$3) ON CONFLICT(date,time) DO UPDATE SET capacity=EXCLUDED.capacity,enabled=true RETURNING id`,[date,time,cap]);res.json(rows[0])}catch(e){next(e)}});
