@@ -11,8 +11,8 @@ const state = {
   config: null
 };
 
-const plDate = d => new Date(d + 'T12:00:00')
-  .toLocaleDateString('pl-PL', {
+const plDate = d =>
+  new Date(d + 'T12:00:00').toLocaleDateString('pl-PL', {
     day: 'numeric',
     month: 'long',
     year: 'numeric'
@@ -22,24 +22,27 @@ const today = new Date();
 today.setHours(0, 0, 0, 0);
 
 const maxDate = new Date(Date.now() + 180 * 864e5);
-const money = n => n.toLocaleString('pl-PL') + ' zł';
+const money = n => Number(n).toLocaleString('pl-PL') + ' zł';
 
 const fallback = {
   packages: {
-    classic: { name: 'Kulig tradycyjny', price: 129 },
-    feast: { name: 'Kulig z biesiadą', price: 189 },
-    private: { name: 'Kulig na wyłączność', price: 2500 },
+    classic: { name: 'Kulig tradycyjny', price: 1200 },
+    feast: { name: 'Kulig z biesiadą', price: 1800 },
+    private: { name: 'Kulig premium na wyłączność', price: 2500 },
     romantic: { name: 'Kulig romantyczny 23:00', price: 3000 }
   },
   slots: ['10:00', '12:30', '15:00', '17:30', '20:00', '23:00'],
-  paymentsEnabled: false
+  paymentsEnabled: false,
+  testMode: false
 };
 
 function updateSummary() {
   const pkg = state.config.packages[state.pkg];
 
   $('#sumPackage').textContent = pkg.name;
-  $('#sumDate').textContent = state.date ? plDate(state.date) : 'Nie wybrano';
+  $('#sumDate').textContent = state.date
+    ? plDate(state.date)
+    : 'Nie wybrano';
   $('#sumTime').textContent = state.time || 'Nie wybrano';
   $('#sumPeople').textContent = state.people + ' os.';
   $('#sumTotal').textContent = money(pkg.price);
@@ -84,7 +87,11 @@ async function refreshCalendar() {
 
 function renderCalendar(loading = false, error = false) {
   const first = new Date(state.year, state.month, 1);
-  const last = new Date(state.year, state.month + 1, 0).getDate();
+  const last = new Date(
+    state.year,
+    state.month + 1,
+    0
+  ).getDate();
 
   $('#monthTitle').textContent = first.toLocaleDateString('pl-PL', {
     month: 'long',
@@ -122,9 +129,7 @@ function renderCalendar(loading = false, error = false) {
 
     b.title = open
       ? 'Dostępne kuligi'
-      : loading
-        ? 'Sprawdzanie dostępności'
-        : 'Brak wolnych kuligów';
+      : 'Brak wolnych kuligów';
 
     b.onclick = () => {
       state.date = iso;
@@ -269,7 +274,11 @@ function selectPkg(pkg) {
     loadSlots();
   }
 
-  if (pkg === 'romantic' && state.time && state.time !== '23:00') {
+  if (
+    pkg === 'romantic' &&
+    state.time &&
+    state.time !== '23:00'
+  ) {
     state.time = null;
     loadSlots();
   }
@@ -310,9 +319,9 @@ const articles = {
   }
 };
 
-function showMessage(t, error) {
+function showMessage(text, error) {
   const el = $('#bookingMessage');
-  el.textContent = t;
+  el.textContent = text;
   el.className = 'message ' + (error ? 'error' : 'success');
 }
 
@@ -327,11 +336,19 @@ async function submitBooking(e) {
     return;
   }
 
+  if (!state.config.testMode) {
+    showMessage(
+      'Rezerwacje są chwilowo niedostępne.',
+      true
+    );
+    return;
+  }
+
   const btn = $('#submitBooking');
   const original = btn.innerHTML;
 
   btn.disabled = true;
-  btn.textContent = 'Zapisywanie...';
+  btn.textContent = 'Zapisywanie rezerwacji...';
 
   try {
     const payload = {
@@ -346,74 +363,31 @@ async function submitBooking(e) {
       consent: $('#consent').checked
     };
 
-    let endpoint = '/api/bookings';
-
-    const headers = {
-      'Content-Type': 'application/json'
-    };
-
-    if (!state.config.paymentsEnabled) {
-      const password = window.prompt(
-        'TEST: Podaj hasło administratora. Żadne pieniądze nie zostaną pobrane.'
-      );
-
-      if (password === null) return;
-
-      const login = await fetch('/api/admin/login', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ password })
-      });
-
-      const authData = await login.json();
-
-      if (!login.ok) {
-        throw Error(
-          authData.error || 'Błąd logowania administratora'
-        );
-      }
-
-      endpoint = '/api/admin/test-booking';
-      headers['x-csrf-token'] = authData.csrf;
-    }
-
-    const response = await fetch(endpoint, {
+    const response = await fetch('/api/bookings', {
       method: 'POST',
-      credentials: 'same-origin',
-      headers,
+      headers: {
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify(payload)
     });
 
     const data = await response.json();
 
     if (!response.ok) {
-      throw Error(data.error || 'Błąd rezerwacji');
+      throw Error(data.error || 'Błąd rezerwacji.');
     }
 
-    if (data.test || data.ok || data.status === 'confirmed') {
-      showMessage(
-        'TEST OK! Rezerwacja zapisana. Numer: ' +
-        data.id +
-        '. Sprawdź panel administratora.',
-        false
-      );
+    showMessage(
+      'TEST OK! Rezerwacja zapisana w bazie. Numer: ' +
+      data.id +
+      '. Sprawdź panel administratora. Nie pobrano płatności.',
+      false
+    );
 
-      state.time = null;
+    state.time = null;
 
-      await loadSlots();
-      await refreshCalendar();
-      return;
-    }
-
-    if (data.checkoutUrl) {
-      location.assign(data.checkoutUrl);
-      return;
-    }
-
-    throw Error('Nie udało się rozpocząć rezerwacji.');
+    await loadSlots();
+    await refreshCalendar();
 
   } catch (err) {
     showMessage(err.message, true);
@@ -426,7 +400,9 @@ async function submitBooking(e) {
 
 async function init() {
   try {
-    const r = await fetch('/api/config');
+    const r = await fetch('/api/config', {
+      cache: 'no-store'
+    });
 
     state.config = r.ok
       ? await r.json()
@@ -436,16 +412,18 @@ async function init() {
     state.config = fallback;
   }
 
-  $('#paymentNote').textContent = state.config.paymentsEnabled
-    ? 'Rezerwacja całego kuligu na wyłączność. Zapłać 50% zaliczki przez Przelewy24, resztę na miejscu.'
-    : 'TRYB TESTOWY ORGANIZATORA — bez prawdziwej płatności. Potwierdzenie wymaga hasła administratora.';
+  $('#paymentNote').textContent = state.config.testMode
+    ? 'TRYB TESTOWY — rezerwacja zapisuje się bez płatności. Żadne pieniądze nie są pobierane.'
+    : 'Rezerwacje są chwilowo niedostępne.';
 
   const select = $('#people');
 
   for (let n = 1; n <= 20; n++) {
     const opt = document.createElement('option');
+
     opt.value = n;
     opt.textContent = n + ' os.';
+
     select.append(opt);
   }
 
@@ -494,15 +472,13 @@ async function init() {
   refreshCalendar();
   updateSummary();
 
-  if (!state.config.paymentsEnabled) {
-    $('#submitBooking').textContent =
-      'TEST: zapisz rezerwację (hasło administratora)';
-  }
+  $('#submitBooking').textContent = state.config.testMode
+    ? 'TEST: potwierdź rezerwację bez płatności'
+    : 'Rezerwacje niedostępne';
 
-  $('#bookingForm').addEventListener(
-    'submit',
-    submitBooking
-  );
+  $('#submitBooking').disabled = !state.config.testMode;
+
+  $('#bookingForm').addEventListener('submit', submitBooking);
 
   $('#year').textContent = new Date().getFullYear();
 
@@ -511,7 +487,9 @@ async function init() {
   };
 
   document.querySelectorAll('#navLinks a').forEach(a => {
-    a.onclick = () => $('#navLinks').classList.remove('open');
+    a.onclick = () => {
+      $('#navLinks').classList.remove('open');
+    };
   });
 
   document.querySelectorAll('.gallery-img').forEach(b => {
@@ -534,13 +512,12 @@ async function init() {
 
       const h = document.createElement('h2');
       h.textContent = a.title;
-
       $('#articleBody').append(h);
 
       a.body.forEach(p => {
-        const e = document.createElement('p');
-        e.textContent = p;
-        $('#articleBody').append(e);
+        const el = document.createElement('p');
+        el.textContent = p;
+        $('#articleBody').append(el);
       });
 
       $('#articleDialog').showModal();
@@ -572,10 +549,7 @@ async function init() {
   }
 
   if (params.get('payment') === 'cancel') {
-    showMessage(
-      'Płatność została anulowana.',
-      true
-    );
+    showMessage('Płatność została anulowana.', true);
   }
 }
 
